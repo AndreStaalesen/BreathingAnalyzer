@@ -39,12 +39,19 @@ except ImportError:
 # SETTINGS - edit these to match your setup
 # --------------------------------------------------------------------------
 
+# Default ports: Windows calls them COM5, COM6 ...; the Raspberry Pi /dev/ttyUSB0, /dev/ttyUSB1.
+# They are only a starting point: the logger checks every USB serial port and finds
+# each sensor by its address, so swapped or renumbered ports don't matter.
+if os.name == "nt":
+    FRONT_PORT, BACK_PORT = "COM5", "COM6"
+else:
+    FRONT_PORT, BACK_PORT = "/dev/ttyUSB0", "/dev/ttyUSB1"
+
 SENSORS = [
     # name     serial port   Modbus address
-    {"name": "front", "port": "COM5", "address": 0x50},
-    {"name": "back",  "port": "COM6", "address": 0x51},
+    {"name": "front", "port": FRONT_PORT, "address": 0x50},
+    {"name": "back",  "port": BACK_PORT,  "address": 0x51},
 ]
-# On the Raspberry Pi the ports are called e.g. "/dev/ttyUSB0" and "/dev/ttyUSB1".
 # If both sensors are daisy-chained on ONE cable, give them the same port.
 
 BAUD_RATE = 115200      # must match the sensors (set in the WitMotion software)
@@ -235,11 +242,40 @@ def list_serial_ports():
         print(f"  {p.device:15s} {p.description}")
 
 
+def find_sensor_ports(sensors):
+    """Ask every given port for every sensor address and return {name: port}.
+
+    COM numbers belong to the USB socket, not the sensor, so they can swap when
+    cables are moved. This finds each sensor wherever it is.
+    """
+    ports = sorted({s["port"] for s in sensors})
+    # Also try every other USB serial port on the computer (p.vid is set only for USB devices)
+    ports += sorted(p.device for p in list_ports.comports() if p.vid is not None and p.device not in ports)
+    found = {}
+    for port in ports:
+        try:
+            ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
+        except serial.SerialException as e:
+            print(f"  {port}: could not open ({e})")
+            continue
+        for s in sensors:
+            if s["name"] in found:
+                continue
+            for _ in range(3):
+                ser.reset_input_buffer()
+                ser.write(build_read_request(s["address"], FIRST_REGISTER, REGISTER_COUNT))
+                if parse_reply(ser.read(REPLY_LENGTH), s["address"]) is not None:
+                    found[s["name"]] = port
+                    break
+        ser.close()
+    return found
+
+
 def sanity_check(name, data):
     """Sensor at rest: |acceleration| should be ~1 g and |quaternion| ~1."""
     acc = math.sqrt(data["acc_x_g"] ** 2 + data["acc_y_g"] ** 2 + data["acc_z_g"] ** 2)
     qn = math.sqrt(sum(data[k] ** 2 for k in ("q0", "q1", "q2", "q3")))
-    ok = 0.7 < acc < 1.3 and 0.95 < qn < 1.05
+    ok = 0.9 < acc < 1.1 and 0.95 < qn < 1.05
     status = "OK" if ok else "CHECK - values look wrong, compare with the WitMotion software"
     print(f"  {name:6s} |acc| = {acc:.3f} g, |q| = {qn:.3f}, angles = "
           f"{data['angle_x_deg']:.1f} / {data['angle_y_deg']:.1f} / {data['angle_z_deg']:.1f} deg  -> {status}")
@@ -265,6 +301,19 @@ def main():
             s["port"] = args.front
         if s["name"] == "back" and args.back:
             s["port"] = args.back
+
+    # Check which port each sensor is actually on (handles swapped COM numbers).
+    print("Looking for sensors...")
+    found = find_sensor_ports(sensors)
+    for s in sensors:
+        if s["name"] not in found:
+            print(f"  {s['name']} (0x{s['address']:02X}) did not answer on any USB serial port.")
+            print("  Check the cable and power, that the baud rate is "
+                  f"{BAUD_RATE}, and that the WitMotion software is fully closed (Task Manager).")
+            return
+        if found[s["name"]] != s["port"]:
+            print(f"  {s['name']} (0x{s['address']:02X}) found on {found[s['name']]} instead of {s['port']} - using that.")
+        s["port"] = found[s["name"]]
 
     # Group sensors by port: one polling thread per port.
     by_port = {}
@@ -298,6 +347,15 @@ def main():
     for key, label in MARKER_LABELS.items():
         print(f"  {key} = {label}")
     print()
+
+    # On Linux (the Pi, also over SSH) the terminal normally waits for Enter.
+    # Switch it to single-key mode while recording and restore it afterwards.
+    old_terminal = None
+    if os.name != "nt" and sys.stdin.isatty():
+        import termios
+        import tty
+        old_terminal = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
 
     for p in pollers:
         p.start()
@@ -353,6 +411,9 @@ def main():
             pass
         finally:
             stop_event.set()
+            if old_terminal is not None:
+                import termios
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_terminal)
             for p in pollers:
                 p.join(timeout=1)
             while not out_queue.empty():            # write anything still waiting

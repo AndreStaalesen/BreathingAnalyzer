@@ -1,0 +1,8 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Analysis output - recreate any time with analyze_breathing.py
+*_analysis.png
+*_phases.csv
+*_windows.csv

@@ -1,0 +1,6 @@
+# Same line endings on Windows and the Raspberry Pi
+* text=auto eol=lf
+
+# Recordings are data: never convert them
+*.csv -text
+*.png binary
